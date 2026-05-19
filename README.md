@@ -1,1 +1,37 @@
-# Amogh
+# STUDENT GRADE
+
+name = input("ENTER STUDENT'S NAME: ")
+grade = input("ENTER STUDENT'S GRADE: ")
+
+print()
+print("GRADE CALCULATOR ACTIVATED")
+print()
+
+MA = float(input("Enter Marks Secured in MATHEMATICS: "))
+SS = float(input("Enter Marks Secured in SOCIAL STUDIES: "))
+SC = float(input("Enter Marks Secured in SCIENCE: "))
+EN = float(input("Enter Marks Secured in ENGLISH: "))
+CS = float(input("Enter Marks Secured in COMPUTER SCIENCE: "))
+KA = float(input("Enter Marks Secured in KANNADA: "))
+
+total = MA + SS + SC + EN + CS + KA
+percentage = total / 6
+
+print()
+print("STUDENT NAME =", name)
+print("STUDENT GRADE =", grade)
+print("TOTAL MARKS OBTAINED =", total)
+print("PERCENTAGE SECURED =", percentage)
+
+print()
+
+if percentage >= 90:
+    print("GRADE A")
+elif percentage >= 75:
+    print("GRADE B")
+elif percentage >= 50:
+    print("GRADE C")
+elif percentage >= 35:
+    print("GRADE D")
+else:
+    print("FAIL")
