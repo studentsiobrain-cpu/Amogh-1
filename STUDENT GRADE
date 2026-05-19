@@ -1,5 +1,3 @@
-# STUDENT GRADE
-
 name = input("ENTER STUDENT'S NAME: ")
 grade = input("ENTER STUDENT'S GRADE: ")
 
