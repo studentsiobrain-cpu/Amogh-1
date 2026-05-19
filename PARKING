@@ -1,0 +1,1080 @@
+"""
+Smart Parking Management System
+================================
+- Tkinter GUI, dark theme
+- SQLite backend (parking.db) — no Excel dependency
+- JPG report export for Active Sessions, Transaction History, Daily Summary
+- 4 floors x 125 slots = 500 total capacity
+- Rs.50 / hour, min 30 min, rounded up to next hour
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from datetime import datetime
+import os, math, sqlite3
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_OK = True
+except ImportError:
+    PIL_OK = False
+
+# ─────────────────────────── CONFIG ─────────────────────────────────────────
+DB_FILE         = "parking.db"
+RATE_PER_HOUR   = 50
+FLOORS          = 4
+SLOTS_PER_FLOOR = 125
+FLOOR_NAMES     = ["Floor 1 (Ground)", "Floor 2", "Floor 3", "Floor 4 (Top)"]
+
+# ─────────────────────────── PALETTE ────────────────────────────────────────
+BG_DARK    = "#0f1117"
+BG_CARD    = "#1a1d27"
+BG_CARD2   = "#22263a"
+ACCENT     = "#6c63ff"
+ACCENT2    = "#00d4aa"
+ACCENT3    = "#ff6b6b"
+ACCENT4    = "#ffd166"
+TEXT_PRI   = "#ffffff"
+TEXT_SEC   = "#a0aec0"
+TEXT_MUTED = "#4a5568"
+BORDER     = "#2d3748"
+SUCCESS    = "#48bb78"
+DANGER     = "#fc8181"
+WARNING    = "#f6ad55"
+
+# ─────────────────────────── DATABASE ───────────────────────────────────────
+class ParkingDB:
+    def __init__(self):
+        self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self._init_schema()
+
+    def _init_schema(self):
+        self.conn.executescript("""
+        CREATE TABLE IF NOT EXISTS active_sessions (
+            slot_id      TEXT PRIMARY KEY,
+            floor        INTEGER,
+            slot_no      INTEGER,
+            vehicle_no   TEXT,
+            entry_time   TEXT,
+            vehicle_type TEXT
+        );
+        CREATE TABLE IF NOT EXISTS transactions (
+            txn_id       TEXT PRIMARY KEY,
+            vehicle_no   TEXT,
+            floor        INTEGER,
+            slot_no      INTEGER,
+            entry_time   TEXT,
+            exit_time    TEXT,
+            duration_hrs REAL,
+            amount       REAL,
+            payment_mode TEXT
+        );
+        """)
+        self.conn.commit()
+
+    def get_active_sessions(self):
+        cur = self.conn.execute("SELECT * FROM active_sessions ORDER BY floor, slot_no")
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_occupied_set(self):
+        cur = self.conn.execute("SELECT slot_id FROM active_sessions")
+        return {r[0] for r in cur.fetchall()}
+
+    def find_vehicle(self, vehicle_no):
+        cur = self.conn.execute(
+            "SELECT * FROM active_sessions WHERE vehicle_no=?", (vehicle_no.upper(),))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def find_free_slot(self, floor):
+        occupied = self.get_occupied_set()
+        for s in range(1, SLOTS_PER_FLOOR + 1):
+            if f"F{floor}S{s:03d}" not in occupied:
+                return s
+        return None
+
+    def park_vehicle(self, floor, slot_no, vehicle_no, vehicle_type):
+        sid   = f"F{floor}S{slot_no:03d}"
+        entry = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute("INSERT INTO active_sessions VALUES (?,?,?,?,?,?)",
+                          (sid, floor, slot_no, vehicle_no.upper(), entry, vehicle_type))
+        self.conn.commit()
+        return sid, entry
+
+    def checkout_vehicle(self, vehicle_no, payment_mode="Cash"):
+        rec = self.find_vehicle(vehicle_no)
+        if not rec:
+            return None
+        exit_dt    = datetime.now()
+        entry_dt   = datetime.strptime(rec["entry_time"], "%Y-%m-%d %H:%M:%S")
+        hours_raw  = max((exit_dt - entry_dt).total_seconds() / 3600, 0.5)
+        hours_bill = math.ceil(hours_raw)
+        amount     = hours_bill * RATE_PER_HOUR
+        txn_id     = "TXN" + exit_dt.strftime("%Y%m%d%H%M%S")
+        exit_str   = exit_dt.strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute("DELETE FROM active_sessions WHERE slot_id=?", (rec["slot_id"],))
+        self.conn.execute("INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?,?)",
+                          (txn_id, vehicle_no.upper(), rec["floor"], rec["slot_no"],
+                           rec["entry_time"], exit_str,
+                           round(hours_raw, 2), amount, payment_mode))
+        self.conn.commit()
+        return {**rec, "txn_id": txn_id, "exit_time": exit_str,
+                "duration_hrs": round(hours_raw, 2),
+                "hours_billed": hours_bill, "amount": amount,
+                "payment_mode": payment_mode}
+
+    def floor_stats(self):
+        occupied = self.get_occupied_set()
+        return [{"floor": f,
+                 "occupied": sum(1 for s in occupied if s.startswith(f"F{f}S")),
+                 "free": SLOTS_PER_FLOOR - sum(1 for s in occupied if s.startswith(f"F{f}S"))}
+                for f in range(1, FLOORS + 1)]
+
+    def get_transactions(self, limit=200):
+        cur = self.conn.execute(
+            "SELECT * FROM transactions ORDER BY exit_time DESC LIMIT ?", (limit,))
+        return [dict(r) for r in cur.fetchall()]
+
+    def today_stats(self):
+        today = datetime.now().strftime("%Y-%m-%d")
+        cur   = self.conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(amount),0) FROM transactions "
+            "WHERE exit_time LIKE ?", (f"{today}%",))
+        return cur.fetchone()
+
+    def search_vehicle(self, vehicle_no):
+        vehicle_no = vehicle_no.upper()
+        rec = self.find_vehicle(vehicle_no)
+        if rec:
+            return "active", rec
+        cur = self.conn.execute(
+            "SELECT * FROM transactions WHERE vehicle_no=? "
+            "ORDER BY exit_time DESC LIMIT 1", (vehicle_no,))
+        row = cur.fetchone()
+        return ("history", dict(row)) if row else (None, None)
+
+
+# ─────────────────────────── JPG REPORT ENGINE ──────────────────────────────
+def _hex_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+def generate_report_jpg(title, subtitle, columns, rows, filename, extra_info=None):
+    if not PIL_OK:
+        raise RuntimeError("Pillow not installed. Run: pip install Pillow")
+
+    def load_font(size, bold=False):
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
+            else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold
+            else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                try:
+                    return ImageFont.truetype(p, size)
+                except Exception:
+                    pass
+        return ImageFont.load_default()
+
+    FT  = load_font(28, bold=True)
+    FS  = load_font(16)
+    FH  = load_font(14, bold=True)
+    FC  = load_font(13)
+    FF  = load_font(12)
+
+    PAD    = 30
+    ROW_H  = 34
+    HDR_H  = 42
+    TOP_H  = 130 if extra_info else 100
+    FTR_H  = 40
+    ncols  = len(columns)
+
+    tmp    = Image.new("RGB", (100, 100))
+    td     = ImageDraw.Draw(tmp)
+
+    def tw(draw, text, fnt):
+        bb = draw.textbbox((0, 0), str(text), font=fnt)
+        return bb[2] - bb[0]
+
+    col_w = []
+    for ci, col in enumerate(columns):
+        w = tw(td, col, FH) + 24
+        for row in rows:
+            w = max(w, tw(td, str(row[ci]) if ci < len(row) else "", FC) + 20)
+        col_w.append(max(w, 80))
+
+    total_w = sum(col_w) + PAD * 2
+    total_h = TOP_H + HDR_H + len(rows) * ROW_H + FTR_H + PAD
+
+    BG_C   = _hex_rgb(BG_DARK)
+    CARD_C = _hex_rgb(BG_CARD)
+    CARD2C = _hex_rgb(BG_CARD2)
+    ACC_C  = _hex_rgb(ACCENT)
+    ACC2C  = _hex_rgb(ACCENT2)
+    ACC4C  = _hex_rgb(ACCENT4)
+    WH     = (255, 255, 255)
+    GREY_C = _hex_rgb(TEXT_SEC)
+    BRD_C  = _hex_rgb(BORDER)
+
+    img  = Image.new("RGB", (total_w, total_h), BG_C)
+    draw = ImageDraw.Draw(img)
+
+    # header band
+    draw.rectangle([0, 0, total_w, TOP_H], fill=ACC_C)
+    draw.text((PAD, 22), title,    font=FT, fill=WH)
+    draw.text((PAD, 62), subtitle, font=FS, fill=(220, 220, 255))
+    if extra_info:
+        draw.text((PAD, 88), extra_info, font=FS, fill=(200, 240, 255))
+    ts = datetime.now().strftime("Generated: %d %b %Y  %I:%M %p")
+    draw.text((total_w - PAD - tw(draw, ts, FS), 68), ts, font=FS, fill=(200, 200, 240))
+
+    # column headers
+    draw.rectangle([0, TOP_H, total_w, TOP_H + HDR_H], fill=CARD2C)
+    x = PAD
+    for ci, (col, cw) in enumerate(zip(columns, col_w)):
+        cx = x + cw // 2 - tw(draw, col, FH) // 2
+        draw.text((cx, TOP_H + (HDR_H - 18) // 2), col, font=FH, fill=ACC2C)
+        if ci < ncols - 1:
+            draw.line([(x + cw, TOP_H), (x + cw, TOP_H + HDR_H)], fill=BRD_C, width=1)
+        x += cw
+
+    # data rows
+    for ri, row in enumerate(rows):
+        y    = TOP_H + HDR_H + ri * ROW_H
+        rbg  = BG_C if ri % 2 == 0 else CARD2C
+        draw.rectangle([PAD - 5, y, total_w - PAD + 5, y + ROW_H], fill=rbg)
+        x = PAD
+        for ci, (val, cw) in enumerate(zip(row, col_w)):
+            cell = str(val)
+            color = WH
+            low   = cell.lower()
+            if "rs " in low or "rs." in low:      color = ACC4C
+            elif "floor" in low:                   color = ACC_C
+            elif low in ("car","bike","suv","truck"): color = ACC2C
+
+            while tw(draw, cell, FC) > cw - 10 and len(cell) > 4:
+                cell = cell[:-4] + "..."
+
+            cx = x + cw // 2 - tw(draw, cell, FC) // 2
+            draw.text((cx, y + (ROW_H - 16) // 2), cell, font=FC, fill=color)
+            if ci < ncols - 1:
+                draw.line([(x + cw, y), (x + cw, y + ROW_H)], fill=BRD_C, width=1)
+            x += cw
+        draw.line([(PAD, y + ROW_H), (total_w - PAD, y + ROW_H)], fill=BRD_C, width=1)
+
+    if not rows:
+        msg = "No records found."
+        draw.text((total_w // 2 - tw(draw, msg, FH) // 2,
+                   TOP_H + HDR_H + 20), msg, font=FH, fill=GREY_C)
+
+    # footer
+    fy  = total_h - FTR_H + 10
+    ftx = f"Smart Parking Management  |  Capacity: 500 vehicles  |  Rate: Rs.{RATE_PER_HOUR}/hr"
+    draw.text((PAD, fy), ftx, font=FF, fill=GREY_C)
+    draw.line([(0, total_h - FTR_H), (total_w, total_h - FTR_H)], fill=BRD_C, width=1)
+
+    # border
+    draw.rectangle([0, 0, total_w - 1, total_h - 1], outline=ACC_C, width=3)
+
+    img.save(filename, "JPEG", quality=95)
+    return filename
+
+
+# ─────────────────────────── BILL WINDOW ─────────────────────────────────────
+class BillWindow(tk.Toplevel):
+    def __init__(self, parent, d):
+        super().__init__(parent)
+        self.title("Parking Receipt")
+        self.configure(bg=BG_DARK)
+        self.resizable(False, False)
+        self.grab_set()
+        self._build(d)
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width()  - self.winfo_width())  // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{x}+{y}")
+
+    def _build(self, d):
+        hdr = tk.Frame(self, bg=ACCENT, pady=18)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="🅿  SMART PARKING", bg=ACCENT, fg="white",
+                 font=("Helvetica", 18, "bold")).pack()
+        tk.Label(hdr, text="OFFICIAL PARKING RECEIPT", bg=ACCENT, fg="#ddd",
+                 font=("Helvetica", 10)).pack()
+
+        body = tk.Frame(self, bg=BG_CARD, padx=34, pady=20)
+        body.pack(fill="x", padx=2, pady=2)
+
+        def row(lbl, val, vc=TEXT_PRI):
+            f = tk.Frame(body, bg=BG_CARD); f.pack(fill="x", pady=3)
+            tk.Label(f, text=lbl, bg=BG_CARD, fg=TEXT_SEC, font=("Helvetica", 10),
+                     width=20, anchor="w").pack(side="left")
+            tk.Label(f, text=val, bg=BG_CARD, fg=vc,
+                     font=("Helvetica", 10, "bold"), anchor="w").pack(side="left")
+
+        def sep():
+            tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=5)
+
+        sep()
+        row("Transaction ID:",  d["txn_id"])
+        row("Vehicle Number:",  d["vehicle_no"], ACCENT2)
+        row("Vehicle Type:",    d["vehicle_type"])
+        row("Floor / Slot:",    f"Floor {d['floor']}  |  Slot {d['slot_no']:03d}")
+        sep()
+        row("Entry Time:",      d["entry_time"])
+        row("Exit Time:",       d["exit_time"])
+        row("Duration:",
+            f"{d['duration_hrs']:.2f} hrs  (billed {d['hours_billed']} hr{'s' if d['hours_billed']>1 else ''})")
+        row("Rate:",            f"Rs. {RATE_PER_HOUR} / hour")
+        sep()
+        row("Payment Mode:",    d["payment_mode"])
+
+        amt_f = tk.Frame(body, bg=ACCENT, pady=12, padx=20)
+        amt_f.pack(fill="x", pady=10)
+        tk.Label(amt_f, text="TOTAL AMOUNT PAID", bg=ACCENT, fg="white",
+                 font=("Helvetica", 10)).pack()
+        tk.Label(amt_f, text=f"Rs. {d['amount']:,.0f}", bg=ACCENT, fg="white",
+                 font=("Helvetica", 22, "bold")).pack()
+
+        sep()
+        tk.Label(body, text="Thank you for parking with us!  Drive safe.",
+                 bg=BG_CARD, fg=TEXT_SEC, font=("Helvetica", 9, "italic")).pack()
+
+        def save_jpg():
+            if not PIL_OK:
+                messagebox.showerror("Missing Library",
+                    "Pillow not installed.\nRun: pip install Pillow"); return
+            path = filedialog.asksaveasfilename(
+                defaultextension=".jpg",
+                filetypes=[("JPEG Image", "*.jpg")],
+                initialfile=f"Receipt_{d['vehicle_no']}_{d['txn_id']}.jpg")
+            if not path: return
+            rows_ = [
+                ["Transaction ID",  d["txn_id"]],
+                ["Vehicle Number",  d["vehicle_no"]],
+                ["Vehicle Type",    d["vehicle_type"]],
+                ["Floor / Slot",    f"Floor {d['floor']}  |  Slot {d['slot_no']:03d}"],
+                ["Entry Time",      d["entry_time"]],
+                ["Exit Time",       d["exit_time"]],
+                ["Duration",        f"{d['duration_hrs']:.2f} hrs (billed {d['hours_billed']} hr)"],
+                ["Rate",            f"Rs. {RATE_PER_HOUR} / hour"],
+                ["Payment Mode",    d["payment_mode"]],
+                ["TOTAL AMOUNT",    f"Rs. {d['amount']:,.0f}"],
+            ]
+            generate_report_jpg("PARKING RECEIPT", f"Vehicle: {d['vehicle_no']}",
+                                ["Field", "Value"], rows_, path,
+                                extra_info=f"Txn: {d['txn_id']}  |  {d['exit_time']}")
+            messagebox.showinfo("Saved", f"Receipt saved:\n{path}")
+
+        btn_row = tk.Frame(self, bg=BG_DARK)
+        btn_row.pack(fill="x", padx=2, pady=2)
+        tk.Button(btn_row, text="  Save Receipt as JPG  ", bg=ACCENT4, fg=BG_DARK,
+                  font=("Helvetica", 10, "bold"), relief="flat", pady=9,
+                  command=save_jpg, cursor="hand2").pack(side="left", fill="x", expand=True)
+        tk.Button(btn_row, text="  Close  ", bg=ACCENT3, fg="white",
+                  font=("Helvetica", 10, "bold"), relief="flat", pady=9,
+                  command=self.destroy, cursor="hand2").pack(side="left", fill="x", expand=True)
+
+
+# ─────────────────────────── MAIN APP ────────────────────────────────────────
+class ParkingApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Smart Parking Management System")
+        self.configure(bg=BG_DARK)
+        self.state("zoomed")
+        self.minsize(1100, 700)
+        self.db = ParkingDB()
+        self._build_ui()
+        self._refresh_all()
+        self.after(30000, self._auto_refresh)
+
+    # ── SKELETON ─────────────────────────────────────────────────
+    def _build_ui(self):
+        self._build_sidebar()
+        self._build_main()
+
+    def _build_sidebar(self):
+        sb = tk.Frame(self, bg=BG_CARD, width=232)
+        sb.pack(side="left", fill="y")
+        sb.pack_propagate(False)
+
+        logo = tk.Frame(sb, bg=ACCENT, pady=20)
+        logo.pack(fill="x")
+        tk.Label(logo, text="P", bg=ACCENT, fg="white",
+                 font=("Helvetica", 40, "bold")).pack()
+        tk.Label(logo, text="SMART PARKING", bg=ACCENT, fg="white",
+                 font=("Helvetica", 11, "bold")).pack()
+        tk.Label(logo, text="Management System", bg=ACCENT, fg="#ccc",
+                 font=("Helvetica", 8)).pack()
+
+        tk.Frame(sb, bg=BORDER, height=1).pack(fill="x", pady=5)
+
+        self.nav_btns = {}
+        for label, key in [
+            ("  Dashboard",           "dashboard"),
+            ("  Vehicle Entry",       "entry"),
+            ("  Vehicle Exit",        "exit"),
+            ("  Active Sessions",     "sessions"),
+            ("  Transaction History", "history"),
+            ("  Search Vehicle",      "search"),
+            ("  Export Reports JPG",  "export"),
+        ]:
+            btn = tk.Button(sb, text=label, bg=BG_CARD, fg=TEXT_SEC,
+                            font=("Helvetica", 10), relief="flat", anchor="w",
+                            padx=20, pady=12, cursor="hand2",
+                            command=lambda k=key: self._switch_page(k))
+            btn.pack(fill="x")
+            self.nav_btns[key] = btn
+
+        tk.Frame(sb, bg=BORDER, height=1).pack(fill="x", pady=5)
+
+        info = tk.Frame(sb, bg=BG_CARD2, padx=15, pady=10)
+        info.pack(fill="x", padx=10, pady=5)
+        tk.Label(info, text="Parking Rate", bg=BG_CARD2, fg=TEXT_SEC,
+                 font=("Helvetica", 9, "bold")).pack(anchor="w")
+        tk.Label(info, text=f"Rs. {RATE_PER_HOUR} / Hour", bg=BG_CARD2, fg=ACCENT4,
+                 font=("Helvetica", 14, "bold")).pack(anchor="w")
+        tk.Label(info, text="Min. 30 min charged", bg=BG_CARD2, fg=TEXT_MUTED,
+                 font=("Helvetica", 8)).pack(anchor="w")
+
+        tk.Label(sb, text="v2.0  |  Capacity: 500", bg=BG_CARD,
+                 fg=TEXT_MUTED, font=("Helvetica", 8)).pack(side="bottom", pady=8)
+
+    def _build_main(self):
+        self.main_frame = tk.Frame(self, bg=BG_DARK)
+        self.main_frame.pack(side="left", fill="both", expand=True)
+
+        topbar = tk.Frame(self.main_frame, bg=BG_CARD, pady=12, padx=20)
+        topbar.pack(fill="x")
+        self.page_title = tk.Label(topbar, text="Dashboard", bg=BG_CARD,
+                                   fg=TEXT_PRI, font=("Helvetica", 16, "bold"))
+        self.page_title.pack(side="left")
+        self.clock_lbl = tk.Label(topbar, text="", bg=BG_CARD, fg=TEXT_SEC,
+                                  font=("Helvetica", 10))
+        self.clock_lbl.pack(side="right")
+        self._tick()
+
+        self.pages = {}
+        self.content = tk.Frame(self.main_frame, bg=BG_DARK)
+        self.content.pack(fill="both", expand=True)
+
+        self._build_dashboard_page()
+        self._build_entry_page()
+        self._build_exit_page()
+        self._build_sessions_page()
+        self._build_history_page()
+        self._build_search_page()
+        self._build_export_page()
+
+        self._switch_page("dashboard")
+
+    def _tick(self):
+        self.clock_lbl.config(
+            text=datetime.now().strftime("%d %b %Y   %I:%M:%S %p"))
+        self.after(1000, self._tick)
+
+    def _switch_page(self, key):
+        for f in self.pages.values():
+            f.pack_forget()
+        self.pages[key].pack(fill="both", expand=True)
+        titles = {
+            "dashboard": "Dashboard",
+            "entry":     "Vehicle Entry",
+            "exit":      "Vehicle Exit & Billing",
+            "sessions":  "Active Sessions",
+            "history":   "Transaction History",
+            "search":    "Search Vehicle",
+            "export":    "Export Reports as JPG",
+        }
+        self.page_title.config(text=titles.get(key, key))
+        for k, btn in self.nav_btns.items():
+            btn.config(bg=ACCENT if k == key else BG_CARD,
+                       fg="white" if k == key else TEXT_SEC)
+        if key == "sessions":  self._refresh_sessions()
+        if key == "history":   self._refresh_history()
+        if key == "dashboard": self._refresh_dashboard()
+
+    # ── DASHBOARD ────────────────────────────────────────────────
+    def _build_dashboard_page(self):
+        page = tk.Frame(self.content, bg=BG_DARK)
+        self.pages["dashboard"] = page
+
+        cards_row = tk.Frame(page, bg=BG_DARK)
+        cards_row.pack(fill="x", padx=20, pady=20)
+        self.stat_cards = {}
+        for key, label, val, color in [
+            ("total_occ",  "Total Occupied",  "0",   ACCENT),
+            ("total_free", "Total Available", "0",   ACCENT2),
+            ("today_txn",  "Today Txns",      "0",   ACCENT4),
+            ("today_rev",  "Today Revenue",   "0",   SUCCESS),
+        ]:
+            card = tk.Frame(cards_row, bg=BG_CARD, padx=20, pady=20)
+            card.pack(side="left", fill="both", expand=True, padx=6)
+            lbl = tk.Label(card, text=val, bg=BG_CARD, fg=color,
+                           font=("Helvetica", 26, "bold"))
+            lbl.pack(anchor="w")
+            tk.Label(card, text=label, bg=BG_CARD, fg=TEXT_SEC,
+                     font=("Helvetica", 9)).pack(anchor="w")
+            self.stat_cards[key] = lbl
+
+        tk.Label(page, text="FLOOR-WISE AVAILABILITY", bg=BG_DARK, fg=TEXT_SEC,
+                 font=("Helvetica", 10, "bold")).pack(anchor="w", padx=25, pady=(5, 3))
+
+        floors_row = tk.Frame(page, bg=BG_DARK)
+        floors_row.pack(fill="x", padx=20)
+        self.floor_widgets = []
+        colors = [ACCENT, ACCENT2, ACCENT4, "#e056fd"]
+        for f in range(FLOORS):
+            card = tk.Frame(floors_row, bg=BG_CARD, padx=15, pady=15)
+            card.pack(side="left", fill="both", expand=True, padx=6)
+            tk.Label(card, text=FLOOR_NAMES[f], bg=BG_CARD, fg=colors[f],
+                     font=("Helvetica", 10, "bold")).pack(anchor="w")
+            bar_bg = tk.Frame(card, bg=BG_CARD2, height=10)
+            bar_bg.pack(fill="x", pady=5)
+            bar = tk.Frame(bar_bg, bg=colors[f], height=10, width=0)
+            bar.place(x=0, y=0, relheight=1)
+            lf = tk.Label(card, text=f"Free: {SLOTS_PER_FLOOR}", bg=BG_CARD,
+                          fg=SUCCESS, font=("Helvetica", 12, "bold"))
+            lf.pack(anchor="w")
+            lo = tk.Label(card, text="Occupied: 0", bg=BG_CARD, fg=DANGER,
+                          font=("Helvetica", 9))
+            lo.pack(anchor="w")
+            lp = tk.Label(card, text="0% full", bg=BG_CARD, fg=TEXT_SEC,
+                          font=("Helvetica", 9))
+            lp.pack(anchor="w")
+            self.floor_widgets.append({"bar": bar, "bar_bg": bar_bg,
+                                       "free": lf, "occ": lo, "pct": lp})
+
+        tk.Label(page, text="SLOT MAP  (filled = occupied)",
+                 bg=BG_DARK, fg=TEXT_SEC, font=("Helvetica", 9, "bold")).pack(
+            anchor="w", padx=25, pady=(12, 3))
+
+        map_frame = tk.Frame(page, bg=BG_DARK)
+        map_frame.pack(fill="both", expand=True, padx=20, pady=5)
+        self.slot_dots = {}
+        for f in range(1, FLOORS + 1):
+            frow = tk.Frame(map_frame, bg=BG_CARD, pady=6, padx=8)
+            frow.pack(fill="x", pady=3)
+            tk.Label(frow, text=f"F{f}", bg=BG_CARD, fg=colors[f - 1],
+                     font=("Helvetica", 9, "bold"), width=3).pack(side="left")
+            df = tk.Frame(frow, bg=BG_CARD)
+            df.pack(side="left", fill="x", expand=True)
+            for s in range(1, SLOTS_PER_FLOOR + 1):
+                sid = f"F{f}S{s:03d}"
+                dot = tk.Label(df, text="o", bg=BG_CARD, fg=SUCCESS,
+                               font=("Helvetica", 7), padx=1)
+                dot.pack(side="left")
+                self.slot_dots[sid] = dot
+
+    def _refresh_dashboard(self):
+        stats  = self.db.floor_stats()
+        tocc   = sum(s["occupied"] for s in stats)
+        tfree  = sum(s["free"]     for s in stats)
+        tc, tv = self.db.today_stats()
+        self.stat_cards["total_occ"].config(text=str(tocc))
+        self.stat_cards["total_free"].config(text=str(tfree))
+        self.stat_cards["today_txn"].config(text=str(int(tc)))
+        self.stat_cards["today_rev"].config(text=f"Rs.{tv:,.0f}")
+        for i, s in enumerate(stats):
+            w   = self.floor_widgets[i]
+            pct = s["occupied"] / SLOTS_PER_FLOOR
+            w["free"].config(text=f"Free: {s['free']}")
+            w["occ"].config(text=f"Occupied: {s['occupied']}")
+            w["pct"].config(
+                text=f"{pct*100:.1f}% full",
+                fg=DANGER if pct > 0.8 else WARNING if pct > 0.5 else SUCCESS)
+            w["bar_bg"].update_idletasks()
+            bw = int(w["bar_bg"].winfo_width() * pct)
+            w["bar"].place(x=0, y=0, relheight=1, width=max(bw, 0))
+        occupied = self.db.get_occupied_set()
+        for sid, dot in self.slot_dots.items():
+            if sid in occupied:
+                dot.config(text="*", fg=DANGER)
+            else:
+                dot.config(text="o", fg=SUCCESS)
+
+    # ── ENTRY PAGE ───────────────────────────────────────────────
+    def _build_entry_page(self):
+        page = tk.Frame(self.content, bg=BG_DARK)
+        self.pages["entry"] = page
+
+        outer = tk.Frame(page, bg=BG_DARK)
+        outer.place(relx=0.5, rely=0.5, anchor="center")
+        card = tk.Frame(outer, bg=BG_CARD, padx=40, pady=35)
+        card.pack()
+
+        tk.Label(card, text="VEHICLE ENTRY", bg=BG_CARD, fg=ACCENT2,
+                 font=("Helvetica", 18, "bold")).pack(pady=(0, 20))
+
+        self.ev_var = tk.StringVar()
+        self.et_var = tk.StringVar(value="Car")
+        self.ef_var = tk.StringVar(value="Auto-Assign")
+
+        fv = tk.Frame(card, bg=BG_CARD); fv.pack(fill="x", pady=6)
+        tk.Label(fv, text="Vehicle Number:", bg=BG_CARD, fg=TEXT_SEC,
+                 font=("Helvetica", 10), width=18, anchor="w").pack(side="left")
+        tk.Entry(fv, textvariable=self.ev_var, bg=BG_CARD2, fg=TEXT_PRI,
+                 insertbackground=TEXT_PRI, font=("Helvetica", 12),
+                 relief="flat", width=22, bd=0).pack(side="left", ipady=8, ipadx=10)
+        self.ev_var.trace_add("write", lambda *_: self.ev_var.set(
+            self.ev_var.get().upper()))
+
+        vt = tk.Frame(card, bg=BG_CARD); vt.pack(fill="x", pady=6)
+        tk.Label(vt, text="Vehicle Type:", bg=BG_CARD, fg=TEXT_SEC,
+                 font=("Helvetica", 10), width=18, anchor="w").pack(side="left")
+        for v in ["Car", "Bike", "SUV", "Truck"]:
+            tk.Radiobutton(vt, text=v, variable=self.et_var, value=v,
+                           bg=BG_CARD, fg=TEXT_PRI, selectcolor=ACCENT,
+                           activebackground=BG_CARD,
+                           font=("Helvetica", 10)).pack(side="left", padx=6)
+
+        ff = tk.Frame(card, bg=BG_CARD); ff.pack(fill="x", pady=6)
+        tk.Label(ff, text="Floor Preference:", bg=BG_CARD, fg=TEXT_SEC,
+                 font=("Helvetica", 10), width=18, anchor="w").pack(side="left")
+        ttk.Combobox(ff, textvariable=self.ef_var,
+                     values=["Auto-Assign"] + [f"Floor {i}" for i in range(1, FLOORS + 1)],
+                     width=20, state="readonly").pack(side="left")
+
+        self.entry_status = tk.Label(card, text="", bg=BG_CARD, fg=TEXT_SEC,
+                                     font=("Helvetica", 10))
+        self.entry_status.pack(pady=8)
+
+        avail_f = tk.Frame(card, bg=BG_CARD2, padx=15, pady=10)
+        avail_f.pack(fill="x", pady=5)
+        af = tk.Frame(avail_f, bg=BG_CARD2); af.pack()
+        self.entry_avail_lbls = []
+        for f in range(1, FLOORS + 1):
+            lf = tk.Frame(af, bg=BG_CARD2, padx=10); lf.pack(side="left")
+            tk.Label(lf, text=f"F{f}", bg=BG_CARD2, fg=TEXT_SEC,
+                     font=("Helvetica", 9)).pack()
+            lbl = tk.Label(lf, text="---", bg=BG_CARD2, fg=ACCENT2,
+                           font=("Helvetica", 12, "bold"))
+            lbl.pack()
+            self.entry_avail_lbls.append(lbl)
+
+        def park():
+            vno = self.ev_var.get().strip().upper()
+            if not vno:
+                messagebox.showerror("Error", "Enter a vehicle number."); return
+            if self.db.find_vehicle(vno):
+                messagebox.showerror("Duplicate", f"{vno} is already parked!"); return
+            pref  = self.ef_var.get()
+            floor = None
+            if pref == "Auto-Assign":
+                for f in range(1, FLOORS + 1):
+                    if self.db.find_free_slot(f) is not None:
+                        floor = f; break
+            else:
+                floor = int(pref.split()[1])
+            if floor is None:
+                messagebox.showerror("Full", "Parking lot is completely full!"); return
+            slot = self.db.find_free_slot(floor)
+            if slot is None:
+                messagebox.showerror("Floor Full", f"Floor {floor} is full!"); return
+            _, entry = self.db.park_vehicle(floor, slot, vno, self.et_var.get())
+            self.entry_status.config(
+                text=f"Parked -- Floor {floor}, Slot {slot:03d}  |  {entry[11:16]}",
+                fg=SUCCESS)
+            self.ev_var.set("")
+            self._refresh_avail_mini()
+            self._refresh_dashboard()
+            messagebox.showinfo("Parked",
+                f"{vno} parked!\nFloor {floor}  |  Slot {slot:03d}\nEntry: {entry}")
+
+        tk.Button(card, text="  PARK VEHICLE  ", bg=ACCENT2, fg=BG_DARK,
+                  font=("Helvetica", 12, "bold"), relief="flat", pady=12,
+                  command=park, cursor="hand2").pack(fill="x", pady=(15, 0))
+
+        self._refresh_avail_mini()
+
+    def _refresh_avail_mini(self):
+        for i, s in enumerate(self.db.floor_stats()):
+            c = SUCCESS if s["free"] > 20 else WARNING if s["free"] > 5 else DANGER
+            self.entry_avail_lbls[i].config(text=str(s["free"]), fg=c)
+
+    # ── EXIT PAGE ────────────────────────────────────────────────
+    def _build_exit_page(self):
+        page = tk.Frame(self.content, bg=BG_DARK)
+        self.pages["exit"] = page
+
+        outer = tk.Frame(page, bg=BG_DARK)
+        outer.place(relx=0.5, rely=0.5, anchor="center")
+        card = tk.Frame(outer, bg=BG_CARD, padx=40, pady=35)
+        card.pack()
+
+        tk.Label(card, text="VEHICLE EXIT & BILLING", bg=BG_CARD, fg=ACCENT3,
+                 font=("Helvetica", 18, "bold")).pack(pady=(0, 20))
+
+        self.xv_var = tk.StringVar()
+        self.xp_var = tk.StringVar(value="Cash")
+
+        fe = tk.Frame(card, bg=BG_CARD); fe.pack(fill="x", pady=6)
+        tk.Label(fe, text="Vehicle Number:", bg=BG_CARD, fg=TEXT_SEC,
+                 font=("Helvetica", 10), width=18, anchor="w").pack(side="left")
+        en = tk.Entry(fe, textvariable=self.xv_var, bg=BG_CARD2, fg=TEXT_PRI,
+                      insertbackground=TEXT_PRI, font=("Helvetica", 12),
+                      relief="flat", width=22, bd=0)
+        en.pack(side="left", ipady=8, ipadx=10)
+        en.bind("<Return>", lambda _: self._fetch_exit())
+
+        pm = tk.Frame(card, bg=BG_CARD); pm.pack(fill="x", pady=6)
+        tk.Label(pm, text="Payment Mode:", bg=BG_CARD, fg=TEXT_SEC,
+                 font=("Helvetica", 10), width=18, anchor="w").pack(side="left")
+        for p in ["Cash", "UPI", "Card", "Wallet"]:
+            tk.Radiobutton(pm, text=p, variable=self.xp_var, value=p,
+                           bg=BG_CARD, fg=TEXT_PRI, selectcolor=ACCENT,
+                           activebackground=BG_CARD,
+                           font=("Helvetica", 10)).pack(side="left", padx=6)
+
+        tk.Button(card, text="  FETCH DETAILS  ", bg=ACCENT4, fg=BG_DARK,
+                  font=("Helvetica", 11, "bold"), relief="flat", pady=10,
+                  command=self._fetch_exit, cursor="hand2").pack(fill="x", pady=8)
+
+        self.exit_info_frame = tk.Frame(card, bg=BG_CARD2, padx=20, pady=15)
+        self.exit_info_frame.pack(fill="x", pady=5)
+        self.exit_info_lbls = {}
+        for k in ["vehicle", "floor_slot", "entry", "duration", "amount"]:
+            lbl = tk.Label(self.exit_info_frame, text="--", bg=BG_CARD2,
+                           fg=TEXT_PRI, font=("Helvetica", 11), anchor="w")
+            lbl.pack(fill="x", pady=2)
+            self.exit_info_lbls[k] = lbl
+
+        self._exit_pending = None
+        self.checkout_btn = tk.Button(
+            card, text="  CHECKOUT & GENERATE BILL  ",
+            bg=ACCENT3, fg="white", font=("Helvetica", 12, "bold"),
+            relief="flat", pady=12, command=self._checkout,
+            cursor="hand2", state="disabled")
+        self.checkout_btn.pack(fill="x", pady=(10, 0))
+
+    def _fetch_exit(self):
+        vno = self.xv_var.get().strip().upper()
+        if not vno: return
+        rec = self.db.find_vehicle(vno)
+        if not rec:
+            messagebox.showerror("Not Found", f"{vno} is not currently parked.")
+            self.checkout_btn.config(state="disabled"); self._exit_pending = None; return
+        entry_dt = datetime.strptime(rec["entry_time"], "%Y-%m-%d %H:%M:%S")
+        hrs      = max((datetime.now() - entry_dt).total_seconds() / 3600, 0.5)
+        amt      = math.ceil(hrs) * RATE_PER_HOUR
+        self.exit_info_lbls["vehicle"].config(
+            text=f"{vno}  --  {rec['vehicle_type']}", fg=ACCENT2)
+        self.exit_info_lbls["floor_slot"].config(
+            text=f"Floor {rec['floor']}  |  Slot {rec['slot_no']:03d}", fg=ACCENT)
+        self.exit_info_lbls["entry"].config(
+            text=f"Entry: {entry_dt.strftime('%d %b %Y  %I:%M %p')}", fg=TEXT_SEC)
+        self.exit_info_lbls["duration"].config(
+            text=f"Duration: {hrs:.2f} hrs  (billing {math.ceil(hrs)} hr)", fg=ACCENT4)
+        self.exit_info_lbls["amount"].config(
+            text=f"Amount Due:  Rs. {amt:,.0f}",
+            fg=SUCCESS, font=("Helvetica", 14, "bold"))
+        self._exit_pending = vno
+        self.checkout_btn.config(state="normal")
+
+    def _checkout(self):
+        if not self._exit_pending: return
+        result = self.db.checkout_vehicle(self._exit_pending, self.xp_var.get())
+        if not result:
+            messagebox.showerror("Error", "Checkout failed."); return
+        self.xv_var.set("")
+        self.checkout_btn.config(state="disabled")
+        self._exit_pending = None
+        for lbl in self.exit_info_lbls.values():
+            lbl.config(text="--", fg=TEXT_PRI, font=("Helvetica", 11))
+        self._refresh_dashboard()
+        BillWindow(self, result)
+
+    # ── SESSIONS PAGE ─────────────────────────────────────────────
+    def _build_sessions_page(self):
+        page = tk.Frame(self.content, bg=BG_DARK)
+        self.pages["sessions"] = page
+
+        fbar = tk.Frame(page, bg=BG_CARD, padx=15, pady=10)
+        fbar.pack(fill="x")
+        tk.Label(fbar, text="Filter by Floor:", bg=BG_CARD, fg=TEXT_SEC,
+                 font=("Helvetica", 10)).pack(side="left", padx=5)
+        self.sess_filter = tk.StringVar(value="All")
+        for opt in ["All"] + [f"Floor {i}" for i in range(1, FLOORS + 1)]:
+            tk.Radiobutton(fbar, text=opt, variable=self.sess_filter, value=opt,
+                           bg=BG_CARD, fg=TEXT_PRI, selectcolor=ACCENT,
+                           activebackground=BG_CARD, font=("Helvetica", 10),
+                           command=self._refresh_sessions).pack(side="left", padx=8)
+        tk.Button(fbar, text="Refresh", bg=ACCENT, fg="white",
+                  font=("Helvetica", 9), relief="flat", padx=10,
+                  command=self._refresh_sessions, cursor="hand2").pack(side="right", padx=5)
+
+        cols   = ("slot_id","floor","slot","vehicle","entry","type","dur")
+        widths = (100,80,70,140,170,90,130)
+        labels = ("Slot ID","Floor","Slot #","Vehicle No","Entry Time","Type","Duration")
+        self.sess_tree = self._make_tree(page, cols, widths, labels)
+
+    def _refresh_sessions(self):
+        for item in self.sess_tree.get_children():
+            self.sess_tree.delete(item)
+        filt = self.sess_filter.get()
+        now  = datetime.now()
+        for d in sorted(self.db.get_active_sessions(),
+                        key=lambda r: (r["floor"], r["slot_no"])):
+            if filt != "All" and d["floor"] != int(filt.split()[1]):
+                continue
+            entry = datetime.strptime(d["entry_time"], "%Y-%m-%d %H:%M:%S")
+            hrs   = (now - entry).total_seconds() / 3600
+            dur   = f"{int(hrs)}h {int((hrs % 1)*60)}m"
+            self.sess_tree.insert("", "end",
+                values=(d["slot_id"], f"Floor {d['floor']}", f"{d['slot_no']:03d}",
+                        d["vehicle_no"], entry.strftime("%d %b %Y %I:%M %p"),
+                        d["vehicle_type"], dur))
+
+    # ── HISTORY PAGE ─────────────────────────────────────────────
+    def _build_history_page(self):
+        page = tk.Frame(self.content, bg=BG_DARK)
+        self.pages["history"] = page
+
+        tk.Button(page, text="Refresh", bg=ACCENT, fg="white",
+                  font=("Helvetica", 9), relief="flat", padx=10,
+                  command=self._refresh_history,
+                  cursor="hand2").pack(anchor="e", padx=20, pady=10)
+
+        cols   = ("txn_id","vehicle","floor","slot","entry","exit","hrs","amount","pay")
+        widths = (160,130,80,70,155,155,90,110,90)
+        labels = ("Transaction ID","Vehicle","Floor","Slot","Entry","Exit","Hrs","Amount","Payment")
+        self.hist_tree = self._make_tree(page, cols, widths, labels)
+
+    def _refresh_history(self):
+        for item in self.hist_tree.get_children():
+            self.hist_tree.delete(item)
+        for r in self.db.get_transactions():
+            self.hist_tree.insert("", "end", values=(
+                r["txn_id"], r["vehicle_no"], f"Floor {r['floor']}",
+                f"{r['slot_no']:03d}", r["entry_time"], r["exit_time"],
+                f"{r['duration_hrs']} hrs", f"Rs.{r['amount']:,.0f}", r["payment_mode"]
+            ))
+
+    # ── SEARCH PAGE ───────────────────────────────────────────────
+    def _build_search_page(self):
+        page = tk.Frame(self.content, bg=BG_DARK)
+        self.pages["search"] = page
+
+        outer = tk.Frame(page, bg=BG_DARK)
+        outer.place(relx=0.5, rely=0.42, anchor="center")
+        card = tk.Frame(outer, bg=BG_CARD, padx=40, pady=30)
+        card.pack()
+
+        tk.Label(card, text="VEHICLE LOOKUP", bg=BG_CARD, fg=ACCENT,
+                 font=("Helvetica", 16, "bold")).pack(pady=(0, 15))
+
+        sv  = tk.StringVar()
+        fe  = tk.Frame(card, bg=BG_CARD); fe.pack(fill="x", pady=5)
+        e   = tk.Entry(fe, textvariable=sv, bg=BG_CARD2, fg=TEXT_PRI,
+                       insertbackground=TEXT_PRI, font=("Helvetica", 14),
+                       relief="flat", width=25, bd=0)
+        e.pack(side="left", ipady=10, ipadx=10)
+
+        res = tk.Label(card, text="Enter a vehicle number to search.",
+                       bg=BG_CARD2, fg=TEXT_SEC, font=("Helvetica", 10),
+                       justify="left", wraplength=380, padx=20, pady=15)
+        res.pack(fill="x", pady=10)
+
+        def search():
+            vno = sv.get().strip().upper(); sv.set(vno)
+            if not vno: return
+            status, data = self.db.search_vehicle(vno)
+            if status == "active":
+                entry = datetime.strptime(data["entry_time"], "%Y-%m-%d %H:%M:%S")
+                hrs   = (datetime.now() - entry).total_seconds() / 3600
+                amt   = math.ceil(hrs) * RATE_PER_HOUR
+                res.config(fg=SUCCESS, text=(
+                    f"CURRENTLY PARKED\n\n"
+                    f"Vehicle: {vno}   Type: {data['vehicle_type']}\n"
+                    f"Floor: {data['floor']}   Slot: {data['slot_no']:03d}\n"
+                    f"Entry: {entry.strftime('%d %b %Y  %I:%M %p')}\n"
+                    f"Duration: {hrs:.2f} hrs\n"
+                    f"Estimated Charge: Rs. {amt:,.0f}"))
+            elif status == "history":
+                res.config(fg=ACCENT4, text=(
+                    f"PAST RECORD\n\nTxn: {data['txn_id']}\n"
+                    f"Vehicle: {data['vehicle_no']}\n"
+                    f"Floor: {data['floor']}   Slot: {data['slot_no']:03d}\n"
+                    f"Entry: {data['entry_time']}   Exit: {data['exit_time']}\n"
+                    f"Duration: {data['duration_hrs']} hrs\n"
+                    f"Paid: Rs. {data['amount']:,.0f}  ({data['payment_mode']})"))
+            else:
+                res.config(fg=DANGER,
+                           text=f"Vehicle {vno} not found in any record.")
+
+        e.bind("<Return>", lambda _: search())
+        tk.Button(fe, text="Search", bg=ACCENT, fg="white",
+                  font=("Helvetica", 11, "bold"), relief="flat", padx=15, pady=6,
+                  command=search, cursor="hand2").pack(side="left", padx=5)
+
+    # ── EXPORT PAGE ───────────────────────────────────────────────
+    def _build_export_page(self):
+        page = tk.Frame(self.content, bg=BG_DARK)
+        self.pages["export"] = page
+
+        outer = tk.Frame(page, bg=BG_DARK)
+        outer.place(relx=0.5, rely=0.5, anchor="center")
+
+        tk.Label(outer, text="EXPORT REPORTS AS JPG",
+                 bg=BG_DARK, fg=ACCENT, font=("Helvetica", 20, "bold")).pack(pady=(0, 6))
+        tk.Label(outer,
+                 text="Choose a report type. A high-quality JPG image will be saved to your chosen location.",
+                 bg=BG_DARK, fg=TEXT_SEC, font=("Helvetica", 10)).pack(pady=(0, 25))
+
+        if not PIL_OK:
+            tk.Label(outer,
+                     text="Pillow library not found.\nRun in terminal:  pip install Pillow\nThen restart the application.",
+                     bg=BG_DARK, fg=WARNING, font=("Helvetica", 11, "bold")).pack(pady=20)
+            return
+
+        for title, desc, cmd, color in [
+            ("Active Sessions Report",
+             "All currently parked vehicles with floor, slot and entry time.",
+             self._export_sessions, ACCENT2),
+            ("Transaction History Report",
+             "Last 200 completed transactions with duration and charges.",
+             self._export_history, ACCENT),
+            ("Floor-wise Summary Report",
+             "Per-floor occupancy, free slots, and utilisation percentage.",
+             self._export_floor_summary, ACCENT4),
+            ("Today's Revenue Report",
+             "All transactions completed today with totals.",
+             self._export_today, SUCCESS),
+        ]:
+            card = tk.Frame(outer, bg=BG_CARD, padx=28, pady=18)
+            card.pack(fill="x", pady=8)
+            top = tk.Frame(card, bg=BG_CARD); top.pack(fill="x")
+            tk.Label(top, text=title, bg=BG_CARD, fg=color,
+                     font=("Helvetica", 13, "bold")).pack(side="left")
+            tk.Button(top, text="Export JPG", bg=color, fg=BG_DARK,
+                      font=("Helvetica", 10, "bold"), relief="flat",
+                      padx=14, pady=5, command=cmd,
+                      cursor="hand2").pack(side="right")
+            tk.Label(card, text=desc, bg=BG_CARD, fg=TEXT_SEC,
+                     font=("Helvetica", 9)).pack(anchor="w", pady=(4, 0))
+
+    def _save_jpg(self, title, subtitle, columns, rows, default_name, extra=None):
+        if not PIL_OK:
+            messagebox.showerror("Missing", "Run: pip install Pillow"); return
+        if not rows:
+            messagebox.showinfo("No Data", "No records to export."); return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".jpg",
+            filetypes=[("JPEG Image", "*.jpg")],
+            initialfile=default_name)
+        if not path: return
+        saved = generate_report_jpg(title, subtitle, columns, rows, path, extra)
+        messagebox.showinfo("Exported", f"Report saved to:\n{saved}")
+
+    def _export_sessions(self):
+        now  = datetime.now()
+        rows = []
+        for d in self.db.get_active_sessions():
+            entry = datetime.strptime(d["entry_time"], "%Y-%m-%d %H:%M:%S")
+            hrs   = (now - entry).total_seconds() / 3600
+            rows.append([d["slot_id"], f"Floor {d['floor']}", f"{d['slot_no']:03d}",
+                         d["vehicle_no"], d["vehicle_type"],
+                         entry.strftime("%d %b %Y %I:%M %p"), f"{hrs:.1f} hrs"])
+        self._save_jpg("Active Sessions Report",
+                       f"Vehicles currently parked  --  {len(rows)} vehicles",
+                       ["Slot ID","Floor","Slot #","Vehicle","Type","Entry Time","Duration"],
+                       rows, "Active_Sessions.jpg",
+                       extra=f"Occupied: {len(rows)}  |  Available: {500-len(rows)}")
+
+    def _export_history(self):
+        rows = []
+        for r in self.db.get_transactions(200):
+            rows.append([r["txn_id"], r["vehicle_no"],
+                         f"Floor {r['floor']}", f"{r['slot_no']:03d}",
+                         r["entry_time"][:16], r["exit_time"][:16],
+                         f"{r['duration_hrs']} hrs",
+                         f"Rs.{r['amount']:,.0f}", r["payment_mode"]])
+        self._save_jpg("Transaction History Report",
+                       f"Last {len(rows)} completed transactions",
+                       ["Txn ID","Vehicle","Floor","Slot","Entry","Exit",
+                        "Duration","Amount","Payment"],
+                       rows, "Transaction_History.jpg")
+
+    def _export_floor_summary(self):
+        stats = self.db.floor_stats()
+        tc, tv = self.db.today_stats()
+        rows  = []
+        for s in stats:
+            pct = s["occupied"] / SLOTS_PER_FLOOR * 100
+            rows.append([FLOOR_NAMES[s["floor"] - 1],
+                         str(SLOTS_PER_FLOOR),
+                         str(s["occupied"]), str(s["free"]),
+                         f"{pct:.1f}%"])
+        tocc = sum(s["occupied"] for s in stats)
+        rows.append(["TOTAL", "500", str(tocc), str(500-tocc),
+                     f"{tocc/500*100:.1f}%"])
+        self._save_jpg("Floor-wise Summary Report",
+                       "Occupancy breakdown by floor",
+                       ["Floor","Capacity","Occupied","Free","Utilisation"],
+                       rows, "Floor_Summary.jpg",
+                       extra=f"Today: {int(tc)} transactions  |  Revenue: Rs.{tv:,.0f}")
+
+    def _export_today(self):
+        today = datetime.now().strftime("%Y-%m-%d")
+        rows  = []
+        total = 0.0
+        for r in self.db.get_transactions(500):
+            if r["exit_time"].startswith(today):
+                rows.append([r["txn_id"], r["vehicle_no"],
+                             f"Floor {r['floor']}", f"{r['slot_no']:03d}",
+                             r["exit_time"][11:16],
+                             f"{r['duration_hrs']} hrs",
+                             f"Rs.{r['amount']:,.0f}", r["payment_mode"]])
+                total += r["amount"]
+        self._save_jpg("Today's Revenue Report",
+                       f"Transactions on {datetime.now().strftime('%d %b %Y')}",
+                       ["Txn ID","Vehicle","Floor","Slot","Exit Time",
+                        "Duration","Amount","Payment"],
+                       rows, f"Revenue_{today}.jpg",
+                       extra=f"Total Transactions: {len(rows)}  |  Total Revenue: Rs.{total:,.0f}")
+
+    # ── TREE HELPER ───────────────────────────────────────────────
+    def _make_tree(self, parent, cols, widths, labels):
+        style = ttk.Style()
+        style.theme_use("default")
+        style.configure("P.Treeview",
+                        background=BG_CARD, fieldbackground=BG_CARD,
+                        foreground=TEXT_PRI, rowheight=30,
+                        font=("Helvetica", 10))
+        style.configure("P.Treeview.Heading",
+                        background=BG_CARD2, foreground=TEXT_PRI,
+                        font=("Helvetica", 10, "bold"), relief="flat")
+        style.map("P.Treeview", background=[("selected", ACCENT)])
+
+        frame = tk.Frame(parent, bg=BG_DARK)
+        frame.pack(fill="both", expand=True, padx=15, pady=10)
+        tree = ttk.Treeview(frame, columns=cols, show="headings", style="P.Treeview")
+        for col, w, lbl in zip(cols, widths, labels):
+            tree.heading(col, text=lbl)
+            tree.column(col, width=w, anchor="center")
+        vsb = ttk.Scrollbar(frame, orient="vertical",   command=tree.yview)
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        tree.pack(fill="both", expand=True)
+        return tree
+
+    def _refresh_all(self):
+        self._refresh_dashboard()
+
+    def _auto_refresh(self):
+        self._refresh_dashboard()
+        self.after(30000, self._auto_refresh)
+
+
+# ─────────────────────────── RUN ─────────────────────────────────────────────
+if __name__ == "__main__":
+    app = ParkingApp()
+    app.mainloop()
