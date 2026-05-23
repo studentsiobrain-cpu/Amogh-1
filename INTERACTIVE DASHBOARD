@@ -1,0 +1,98 @@
+import tkinter as tk
+from tkinter import messagebox
+from tkinter import Label, Button
+root = tk.Tk()
+root.title("INTERACTIVE DASHBOARD")
+root.geometry("592x840")
+root.configure(bg="lightblue")
+
+
+def student():
+    new1 = tk.Toplevel(root)
+    new1.title("PROFILE")
+    new1.geometry("400x400")
+    new1.configure(bg="lightblue")
+    label1 = Label(new1, text="STUDENT PROFILE", bg="lightblue", font=("Arial", 16, "bold"))
+    label1.pack(pady=20)
+    label_name = Label(new1, text="Name:", bg="lightblue", font=("Arial", 12))
+    label_name.place(x=50, y=100)
+    label_name_value = Label(new1, text="Amogh", bg="lightblue", font=("Arial", 12))
+    label_name_value.place(x=150, y=100)
+    label_age = Label(new1, text="Age:", bg="lightblue", font=("Arial", 12))
+    label_age.place(x=50, y=130)
+    label_age_value = Label(new1, text="20", bg="lightblue", font=("Arial", 12))
+    label_age_value.place(x=150, y=130)
+    label_grade = Label(new1, text="Grade:", bg="lightblue", font=("Arial", 12))
+    label_grade.place(x=50, y=160)
+    label_grade_value = Label(new1, text="11th", bg="lightblue", font=("Arial", 12))
+    label_grade_value.place(x=150, y=160)
+    label_school = Label(new1, text="School:", bg="lightblue", font=("Arial", 12))
+    label_school.place(x=50, y=190)
+    label_school_value = Label(new1, text="National Public School", bg="lightblue", font=("Arial", 12))
+    label_school_value.place(x=150, y=190)
+    label_city = Label(new1, text="City:", bg="lightblue", font=("Arial", 12))
+    label_city.place(x=50, y=220)
+    label_city_value = Label(new1, text="Bangalore", bg="lightblue", font=("Arial", 12))
+    label_city_value.place(x=150, y=220)
+
+
+def tea():
+    new2 = tk.Toplevel(root)
+    new2.title("MARKS")
+    new2.geometry("400x400")
+    new2.configure(bg="lightblue")
+    label2 = Label(new2, text="MARKS", bg="lightblue", font=("Arial", 16, "bold"))
+    label2.pack(pady=20)
+    label_subject1 = Label(new2, text="Maths:", bg="lightblue", font=("Arial", 12))
+    label_subject1.place(x=50, y=100)
+    label_marks1 = Label(new2, text="95", bg="lightblue", font=("Arial", 12))
+    label_marks1.place(x=150, y=100)
+    label_subject2 = Label(new2, text="Science:", bg="lightblue", font=("Arial", 12))
+    label_subject2.place(x=50, y=130)
+    label_marks2 = Label(new2, text="92", bg="lightblue", font=("Arial", 12))
+    label_marks2.place(x=150, y=130)
+    label_subject3 = Label(new2, text="English:", bg="lightblue", font=("Arial", 12))
+    label_subject3.place(x=50, y=160)
+    label_marks3 = Label(new2, text="88", bg="lightblue", font=("Arial", 12))
+    label_marks3.place(x=150, y=160)
+    label_subject4 = Label(new2, text="History:", bg="lightblue", font=("Arial", 12))
+    label_subject4.place(x=50, y=190)
+    label_marks4 = Label(new2, text="90", bg="lightblue", font=("Arial", 12))
+    label_marks4.place(x=150, y=190)
+    Label_subject5 = Label(new2, text="Geography:", bg="lightblue", font=("Arial", 12))
+    Label_subject5.place(x=50, y=220)
+    label_marks5 = Label(new2, text="94", bg="lightblue", font=("Arial", 12))
+    label_marks5.place(x=150, y=220)
+    label_total = Label(new2, text="Total:", bg="lightblue", font=("Arial", 12, "bold"))
+    label_total.place(x=50, y=260)
+    label_total_marks = Label(new2, text="459", bg="lightblue", font=("Arial", 12, "bold"))
+    label_total_marks.place(x=150, y=260)
+
+
+
+def about():
+    new3 = tk.Toplevel(root)
+    new3.title("ABOUT")
+    new3.geometry("400x400")
+    new3.configure(bg="lightblue")
+    label3 = Label(new3, text="ABOUT", bg="lightblue", font=("Arial", 16, "bold"))
+    label3.pack(pady=20)
+    label_info = Label(new3, text="Hello, I am Amogh a student in Class 11th at National Public School in Bangalore.I have been studying here for the past few years and have developed a strong interest in science and mathematics.I enjoy participating in science fairs and math competitions.I also like to play music.", bg="lightblue", font=("Arial", 12), wraplength=350, justify="left")
+    label_info.pack(pady=10)
+
+
+def logout():
+    result = messagebox.askquestion("Logout", "Are you sure you want to logout?")
+    if result == "yes":
+        root.destroy()
+
+button1 = tk.Button(root, text="PROFILE", bg="white", fg="black", command=student, font=("Arial", 12, "bold"))
+button1.place(x=50, y=50, width=190, height=50)
+button2 = tk.Button(root, text="MARKS", bg="white", fg="black", command=tea, font=("Arial", 12, "bold"))
+button2.place(x=50, y=120, width=190, height=50)
+button3 = tk.Button(root, text="ABOUT ", bg="white", fg="black", command=about, font=("Arial", 12, "bold"))
+button3.place(x=50, y=190, width=190, height=50)
+button4 = tk.Button(root, text="LOGOUT", bg="white", fg="black", command=logout, font=("Arial", 12, "bold"))
+button4.place(x=50, y=260, width=190, height=50)
+
+root.mainloop()
