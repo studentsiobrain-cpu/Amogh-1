@@ -1,0 +1,150 @@
+import tkinter as tk
+import datetime
+from tkinter import ttk
+from tkinter import colorchooser
+import turtle
+from turtle import color
+from tkinter import messagebox
+from tkinter import filedialog
+from tkinter.ttk import Style
+from tkinter import font
+from tkinter.ttk import Checkbutton
+
+
+root = tk.Tk()
+root.title("DAILY DIARY")
+root.geometry("1790x870")
+root.configure(bg="lightpink")
+
+border_color = "hotpink"
+border_width = 12
+frame = tk.Frame(root, bg="white", highlightbackground=border_color, highlightthickness=border_width)
+frame.pack(padx=20, pady=20, fill="both", expand=True)
+
+DAILY_DIARY = tk.Label(frame, text="DAILY DIARY", font=("Segoe Script", 24, "italic")
+, bg="white", fg="maroon")
+DAILY_DIARY.pack(pady=10)
+
+def date_time():
+    now = datetime.datetime.now()
+    return now.strftime("%Y-%m-%d %H:%M:%S")
+
+label_date_time = tk.Label(frame, text="", font=("Arial", 12), bg="white")
+label_date_time.place(x=10, y=10)
+
+def update_datetime():
+
+    label_date_time.config(text=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    root.after(1000, update_datetime)
+
+update_datetime()
+
+
+ABOUTME = tk.Label(frame, text="ABOUT ME", font=("Lucida Handwriting", 20), bg="white")
+ABOUTME.place(x=140, y=100)
+about_me_text = tk.Label(frame, text="Hi! I am Amogh, a student of 11th grade studying at NPS.I also study at ALLEN and am currently getting trained in Python programming at IoBRAIn Labz.I am interested in technology, coding, and music. One of my favorite hobbies is playing the keyboard." , width=40, height=10,justify="left",wraplength=300, font=("Arial", 12), bg="lightblue", fg="black", bd=2, relief="groove")
+about_me_text.place(x=35, y=150)
+
+DAY1= tk.Label(frame, text="DAY 1", font=("Lucida Handwriting", 20), bg="white")
+DAY1.place(x=600, y=100)
+day1entry = tk.Text(frame, width=40, height=10, font=("Arial", 12), bg="orange", fg="black", bd=2, relief="groove")
+day1entry.place(x=470, y=150)
+
+DAY2= tk.Label(frame, text="DAY 2", font=("Lucida Handwriting", 20), bg="white")
+DAY2.place(x=1020, y=100)
+day2entry = tk.Text(frame, width=40, height=10, font=("Arial", 12), bg="peachpuff", fg="black", bd=2, relief="groove")
+day2entry.place(x=900, y=150)
+
+DAY3= tk.Label(frame, text="DAY 3", font=("Lucida Handwriting", 20), bg="white")
+DAY3.place(x=35, y=400)
+day3entry = tk.Text(frame, width=40, height=10, font=("Arial", 12), bg="lightgreen", fg="black", bd=2, relief="groove")
+day3entry.place(x=35, y=450)
+
+DAY4= tk.Label(frame, text="DAY 4", font=("Lucida Handwriting", 20), bg="white")
+DAY4.place(x=470, y=400)
+day4entry = tk.Text(frame, width=40, height=10, font=("Arial", 12), bg="lightyellow", fg="black", bd=2, relief="groove")
+day4entry.place(x=470, y=450)
+
+DAY5= tk.Label(frame, text="DAY 5", font=("Lucida Handwriting", 20), bg="white")
+DAY5.place(x=900, y=400)
+day5entry = tk.Text(frame, width=40, height=10, font=("Arial", 12), bg="lightcyan", fg="black", bd=2, relief="groove")
+day5entry.place(x=900, y=450)
+
+# TO DO LIST (checklist)
+TODOLIST = tk.Label(frame, text="TO DO LIST", font=("Lucida Handwriting", 20), bg="white")
+TODOLIST.place(x=1300, y=100)
+todo_frame = tk.Frame(frame, bg="white")
+todo_frame.place(x=1280, y=150)
+
+todo_vars = []
+initial_tasks = [
+    "Buy groceries",
+    "Study Python",
+    "Practice keyboard",
+    "Read book",
+    "Exercise",
+    "Revise school subjects",
+    "Study Chemistry",
+    "Study Physics",
+
+]
+for t in initial_tasks:
+    var = tk.BooleanVar(value=False)
+    cb = tk.Checkbutton(todo_frame, text=t, variable=var, bg="white", anchor="w", justify="left")
+    cb.pack(anchor="w", pady=2)
+    todo_vars.append(var)
+
+def get_completed_tasks():
+    return [initial_tasks[i] for i, v in enumerate(todo_vars) if v.get()]
+
+def show_completed(event=None):
+    done = get_completed_tasks()
+    messagebox.showinfo("Completed Tasks", "\n".join(done) if done else "No tasks completed yet")
+
+# right-click the todo area to see completed tasks
+todo_frame.bind("<Button-3>", show_completed)
+
+def save_journal():
+    file_path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text files", "*.txt")])
+    if file_path:
+        with open(file_path, "w") as f:
+            f.write("DAY 1:\n")
+            f.write(day1entry.get("1.0", tk.END).strip() + "\n\n")
+            f.write("DAY 2:\n")
+            f.write(day2entry.get("1.0", tk.END).strip() + "\n\n")
+            f.write("DAY 3:\n")
+            f.write(day3entry.get("1.0", tk.END).strip() + "\n\n")
+            f.write("DAY 4:\n")
+            f.write(day4entry.get("1.0", tk.END).strip() + "\n\n")
+            f.write("DAY 5:\n")
+            f.write(day5entry.get("1.0", tk.END).strip() + "\n\n")
+            f.write("TO DO LIST:\n")
+            for i, var in enumerate(todo_vars):
+                status = "Done" if var.get() else "Pending"
+                f.write(f"{initial_tasks[i]} - {status}\n")
+        messagebox.showinfo("Save Journal", "Journal saved successfully!")
+
+save_button = tk.Button(frame, text="Save Journal", command=save_journal, bg="lightblue", fg="black", font=("Arial", 12), bd=2, relief="groove")
+save_button.place(x=1300, y=400)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+root.mainloop()
